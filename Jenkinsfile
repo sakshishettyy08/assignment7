@@ -3,11 +3,12 @@ pipeline {
 
   environment {
     AWS_REGION = 'us-east-1'
-    ECR_REPO = '866934333672.dkr.ecr.us-east-1.amazonaws.com/assignment'
-  }
-
-  options {
-    skipDefaultCheckout()
+    AWS_ACCOUNT_ID = '866934333672'
+    ECR_REPO_NAME = 'assignment'
+    CLUSTER_NAME = 'assignment-7'
+    SERVICE_NAME = 'assignment-service'
+    TASK_DEF_NAME = 'assignment-task'
+    CONTAINER_NAME = 'assignment-container'
   }
 
   stages {
@@ -27,30 +28,64 @@ pipeline {
         script {
           COMMIT_HASH = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
           IMAGE_TAG = "alpha-${COMMIT_HASH}"
-          sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+          IMAGE_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${IMAGE_TAG}"
+          sh "docker build -t ${IMAGE_URI} ."
         }
       }
     }
 
-    stage('Authenticate with ECR') {
+    stage('Login to ECR') {
       steps {
-        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REPO}"
+        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
       }
     }
 
     stage('Push Docker Image to ECR') {
       steps {
+        sh "docker push ${IMAGE_URI}"
+      }
+    }
+
+    stage('Fetch Current Task Definition') {
+      steps {
         script {
-          sh "docker push ${ECR_REPO}:${IMAGE_TAG}"
+          sh """
+            aws ecs describe-task-definition \
+              --task-definition ${TASK_DEF_NAME} \
+              --region ${AWS_REGION} \
+              --query 'taskDefinition' \
+              > taskdef.json
+          """
         }
       }
     }
 
-    stage('Trigger CD Pipeline') {
+    stage('Register New Task Definition Revision') {
       steps {
-        build job: 'CD-Pipeline-Deploy-to-ECS', parameters: [
-          string(name: 'IMAGE_TAG', value: "${IMAGE_TAG}")
-        ]
+        script {
+          sh """
+            cat taskdef.json | jq '
+              .containerDefinitions[0].image = "${IMAGE_URI}" |
+              del(.status, .revision, .taskDefinitionArn, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            ' > new-taskdef.json
+
+            aws ecs register-task-definition \
+              --cli-input-json file://new-taskdef.json \
+              --region ${AWS_REGION}
+          """
+        }
+      }
+    }
+
+    stage('Update ECS Service') {
+      steps {
+        sh """
+          aws ecs update-service \
+            --cluster ${CLUSTER_NAME} \
+            --service ${SERVICE_NAME} \
+            --task-definition ${TASK_DEF_NAME} \
+            --region ${AWS_REGION}
+        """
       }
     }
   }
